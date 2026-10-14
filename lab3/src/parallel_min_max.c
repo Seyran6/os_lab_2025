@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 
 #include <sys/time.h>
 #include <sys/types.h>
@@ -16,16 +17,31 @@
 #include "find_min_max.h"
 #include "utils.h"
 
+static pid_t *child_pids = NULL;
+static int child_count = 0;
+static volatile sig_atomic_t timed_out = 0;
+
+// Обработчик SIGALRM: по истечении таймаута убиваем всех ещё живых детей
+static void alarm_handler(int sig) {
+  (void)sig;
+  timed_out = 1;
+  for (int i = 0; i < child_count; i++) {
+    if (child_pids[i] > 0) kill(child_pids[i], SIGKILL);
+  }
+}
+
 int main(int argc, char **argv) {
   int seed = -1;
   int array_size = -1;
   int pnum = -1;
+  int timeout = 0;  // 0 - таймаут не задан
   bool with_files = false;
 
   while (true) {
     static struct option options[] = {{"seed", required_argument, 0, 0},
                                       {"array_size", required_argument, 0, 0},
                                       {"pnum", required_argument, 0, 0},
+                                      {"timeout", required_argument, 0, 0},
                                       {"by_files", no_argument, 0, 'f'},
                                       {0, 0, 0, 0}};
 
@@ -59,7 +75,11 @@ int main(int argc, char **argv) {
             }
             break;
           case 3:
-            with_files = true;
+            timeout = atoi(optarg);
+            if (timeout <= 0) {
+              printf("timeout must be a positive number\n");
+              return 1;
+            }
             break;
           default:
             printf("Index %d is out of options\n", option_index);
@@ -83,7 +103,8 @@ int main(int argc, char **argv) {
   }
 
   if (seed == -1 || array_size == -1 || pnum == -1) {
-    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" [--by_files]\n",
+    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" "
+           "[--timeout \"sec\"] [--by_files]\n",
            argv[0]);
     return 1;
   }
@@ -99,11 +120,19 @@ int main(int argc, char **argv) {
   GenerateArray(array, array_size, seed);
   int active_child_processes = 0;
 
+  child_pids = calloc(pnum, sizeof(pid_t));
+  if (child_pids == NULL) {
+    printf("calloc failed\n");
+    free(array);
+    return 1;
+  }
+
   int pipefd[2] = {-1, -1};
   if (!with_files) {
     if (pipe(pipefd) == -1) {
       perror("pipe");
       free(array);
+      free(child_pids);
       return 1;
     }
   }
@@ -135,6 +164,7 @@ int main(int argc, char **argv) {
           fclose(f);
         } else {
           close(pipefd[0]);
+          sleep(5);
           if (write(pipefd[1], &local, sizeof(local)) != sizeof(local)) {
             perror("write");
             _exit(1);
@@ -143,24 +173,55 @@ int main(int argc, char **argv) {
         }
         return 0;
       }
+      // parent: запоминаем pid ребёнка
+      child_pids[i] = child_pid;
+      child_count = i + 1;
 
     } else {
       printf("Fork failed!\n");
       free(array);
+      free(child_pids);
       return 1;
     }
   }
 
   if (!with_files) close(pipefd[1]);
 
+  // Если задан таймаут - ставим будильник
+  if (timeout > 0) {
+    signal(SIGALRM, alarm_handler);
+    alarm(timeout);
+  }
+
+  // Неблокирующее ожидание детей
   while (active_child_processes > 0) {
-    wait(NULL);
-    active_child_processes -= 1;
+    int status;
+    pid_t r = waitpid(-1, &status, WNOHANG);
+    if (r > 0) {
+      for (int i = 0; i < child_count; i++) {
+        if (child_pids[i] == r) child_pids[i] = 0;  // уже завершён
+      }
+      active_child_processes -= 1;
+    } else if (r == 0) {
+      usleep(1000);  // дети ещё работают
+    } else if (errno == EINTR) {
+      continue;
+    } else {
+      perror("waitpid");
+      break;
+    }
+  }
+
+  if (timeout > 0) alarm(0);  // все дети завершились - будильник не нужен
+
+  if (timed_out) {
+    printf("Timeout (%d s) expired: remaining children were killed\n", timeout);
   }
 
   struct MinMax min_max;
   min_max.min = INT_MAX;
   min_max.max = INT_MIN;
+  int received = 0;
 
   for (int i = 0; i < pnum; i++) {
     int min = INT_MAX;
@@ -172,9 +233,12 @@ int main(int argc, char **argv) {
       snprintf(filename, sizeof(filename), "minmax_%d.bin", i);
       FILE *f = fopen(filename, "rb");
       if (f == NULL || fread(&local, sizeof(local), 1, f) != 1) {
-        printf("Failed to read %s\n", filename);
         if (f) fclose(f);
+        remove(filename);
+        if (timed_out) continue;  // ребёнок убит, результата нет
+        printf("Failed to read %s\n", filename);
         free(array);
+        free(child_pids);
         return 1;
       }
       fclose(f);
@@ -182,15 +246,19 @@ int main(int argc, char **argv) {
       min = local.min;
       max = local.max;
     } else {
-      if (read(pipefd[0], &local, sizeof(local)) != sizeof(local)) {
+      ssize_t n = read(pipefd[0], &local, sizeof(local));
+      if (n == 0 && timed_out) break;  // EOF: остальные дети убиты
+      if (n != sizeof(local)) {
         printf("Failed to read from pipe\n");
         free(array);
+        free(child_pids);
         return 1;
       }
       min = local.min;
       max = local.max;
     }
 
+    received++;
     if (min < min_max.min) min_max.min = min;
     if (max > min_max.max) min_max.max = max;
   }
@@ -204,9 +272,17 @@ int main(int argc, char **argv) {
   elapsed_time += (finish_time.tv_usec - start_time.tv_usec) / 1000.0;
 
   free(array);
+  free(child_pids);
 
-  printf("Min: %d\n", min_max.min);
-  printf("Max: %d\n", min_max.max);
+  if (received == 0) {
+    printf("No results received\n");
+  } else {
+    if (received < pnum) {
+      printf("Result is partial: %d of %d processes finished\n", received, pnum);
+    }
+    printf("Min: %d\n", min_max.min);
+    printf("Max: %d\n", min_max.max);
+  }
   printf("Elapsed time: %fms\n", elapsed_time);
   fflush(NULL);
   return 0;
