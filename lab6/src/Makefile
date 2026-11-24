@@ -1,5 +1,5 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -pthread
+CFLAGS  = -Wall -pthread
 AR      = ar
 LIB     = libfactorial.a
 LIB_OBJ = factorial.o netio.o
